@@ -24,13 +24,12 @@ impl MappedFile {
 
     fn build_line_index(&mut self) {
         let data = &self.mmap[..];
-        let mut offset = 0;
 
         for (i, &byte) in data.iter().enumerate() {
             if byte == b'\n' {
-                offset = i + 1;
-                if offset < data.len() {
-                    self.line_offsets.push(offset);
+                let next_line_start = i + 1;
+                if next_line_start < data.len() {
+                    self.line_offsets.push(next_line_start);
                 }
             }
         }
@@ -77,7 +76,4 @@ impl MappedFile {
         lines
     }
 
-    pub fn file_size(&self) -> usize {
-        self.mmap.len()
-    }
 }
