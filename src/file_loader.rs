@@ -3,19 +3,25 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 
+use crate::error::Result;
+use crate::file_source::FileSource;
+
 pub struct MappedFile {
     mmap: Mmap,
     line_offsets: Vec<usize>,
+    path_display: String,
 }
 
 impl MappedFile {
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let file = File::open(path)?;
+        let path_display = path.as_ref().display().to_string();
+        let file = File::open(&path)?;
         let mmap = unsafe { Mmap::map(&file)? };
 
         let mut loader = Self {
             mmap,
             line_offsets: vec![0],
+            path_display,
         };
 
         loader.build_line_index();
@@ -35,11 +41,7 @@ impl MappedFile {
         }
     }
 
-    pub fn line_count(&self) -> usize {
-        self.line_offsets.len()
-    }
-
-    pub fn get_line(&self, line_num: usize) -> Option<&str> {
+    fn get_line_internal(&self, line_num: usize) -> Option<&str> {
         if line_num >= self.line_offsets.len() {
             return None;
         }
@@ -65,15 +67,28 @@ impl MappedFile {
 
         std::str::from_utf8(line_bytes).ok()
     }
+}
 
-    pub fn get_lines(&self, start_line: usize, count: usize) -> Vec<(usize, &str)> {
-        let mut lines = Vec::with_capacity(count);
-        for i in start_line..(start_line + count).min(self.line_count()) {
-            if let Some(line) = self.get_line(i) {
-                lines.push((i, line));
-            }
-        }
-        lines
+impl FileSource for MappedFile {
+    fn line_count(&self) -> usize {
+        self.line_offsets.len()
     }
 
+    fn get_line(&self, line_num: usize) -> Result<Option<String>> {
+        Ok(self.get_line_internal(line_num).map(|s| s.to_string()))
+    }
+
+    fn get_lines(&self, start_line: usize, count: usize) -> Result<Vec<(usize, String)>> {
+        let mut lines = Vec::with_capacity(count);
+        for i in start_line..(start_line + count).min(self.line_count()) {
+            if let Some(line) = self.get_line_internal(i) {
+                lines.push((i, line.to_string()));
+            }
+        }
+        Ok(lines)
+    }
+
+    fn display_name(&self) -> &str {
+        &self.path_display
+    }
 }
