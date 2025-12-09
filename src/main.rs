@@ -1,8 +1,10 @@
 mod cache;
+mod commands;
 mod error;
 mod file_loader;
 mod file_source;
 mod remote_loader;
+mod server;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -17,9 +19,11 @@ use gtk4::{
     Box as GtkBox, Scrollbar,
 };
 
+use commands::{CommandResponse, PogCommand};
 use file_loader::MappedFile;
 use file_source::FileSource;
 use remote_loader::RemoteFile;
+use server::CommandRequest;
 
 #[derive(Debug, Clone)]
 pub enum FilePath {
@@ -55,6 +59,12 @@ fn parse_file_path(s: &str) -> Result<FilePath, String> {
 struct Args {
     #[arg(value_parser = parse_file_path)]
     file: FilePath,
+
+    #[arg(long, default_value = "9876", help = "Port for the command server")]
+    port: u16,
+
+    #[arg(long, help = "Disable the command server")]
+    no_server: bool,
 }
 
 const LINES_PER_PAGE: usize = 50;
@@ -137,6 +147,9 @@ fn main() -> glib::ExitCode {
         },
     };
 
+    let port = args.port;
+    let no_server = args.no_server;
+
     let app = Application::builder()
         .application_id("com.github.pog")
         .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
@@ -145,13 +158,13 @@ fn main() -> glib::ExitCode {
     let file_source_clone = file_source.clone();
 
     app.connect_activate(move |app| {
-        build_ui(app, file_source_clone.clone());
+        build_ui(app, file_source_clone.clone(), port, no_server);
     });
 
     app.run_with_args::<&str>(&[])
 }
 
-fn build_ui(app: &Application, file_source: Arc<dyn FileSource>) {
+fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_server: bool) {
     let window = ApplicationWindow::builder()
         .application(app)
         .title(&format!("pog - {}", file_source.display_name()))
@@ -160,6 +173,14 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>) {
         .build();
 
     let total_lines = file_source.line_count();
+
+    let (command_tx, command_rx) = async_channel::unbounded::<CommandRequest>();
+
+    if !no_server {
+        if let Err(e) = server::start_server(port, command_tx) {
+            eprintln!("Failed to start command server: {}", e);
+        }
+    }
 
     // Content box for log lines
     let content_box = GtkBox::new(Orientation::Vertical, 0);
@@ -224,6 +245,28 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>) {
                     eprintln!("Error: {}", message);
                 }
             }
+        }
+    });
+
+    // Command handler for socket server
+    let v_adjustment_cmd = v_adjustment.clone();
+    glib::spawn_future_local(async move {
+        while let Ok(request) = command_rx.recv().await {
+            let response = match request.command {
+                PogCommand::Goto { line } => {
+                    if line == 0 || line > total_lines {
+                        CommandResponse::Error(format!(
+                            "line out of range: requested {}, file has {} lines",
+                            line, total_lines
+                        ))
+                    } else {
+                        let line_0based = (line - 1) as f64;
+                        v_adjustment_cmd.set_value(line_0based);
+                        CommandResponse::Ok(None)
+                    }
+                }
+            };
+            let _ = request.response_tx.send(response);
         }
     });
 
