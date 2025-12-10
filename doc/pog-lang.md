@@ -66,6 +66,115 @@ goto 0
 ERROR line number must be >= 1
 ```
 
+### lines
+
+Get the total number of lines in the file.
+
+**Syntax:**
+```
+lines
+```
+
+**Response:**
+- `OK <count>` - the total line count
+
+**Examples:**
+```
+lines
+OK 35655272
+```
+
+### top
+
+Get the current top visible line number.
+
+**Syntax:**
+```
+top
+```
+
+**Response:**
+- `OK <line_number>` - 1-based line number of the topmost visible line
+
+**Examples:**
+```
+top
+OK 500
+```
+
+### size
+
+Get the file size in bytes.
+
+**Syntax:**
+```
+size
+```
+
+**Response:**
+- `OK <bytes>` - file size in bytes
+
+**Examples:**
+```
+size
+OK 52428800
+```
+
+### mark
+
+Highlight a specific line with a color.
+
+**Syntax:**
+```
+mark <line_number> <color>
+```
+
+**Arguments:**
+- `line_number`: 1-based line number
+- `color`: Any valid CSS color (named colors like `red`, `blue`, or hex codes like `#FF0000`)
+
+**Response:**
+- `OK` on success
+- `ERROR line out of range: requested <N>, file has <M> lines` if line number is invalid
+
+**Examples:**
+```
+mark 100 red
+OK
+
+mark 200 #00FF00
+OK
+
+mark 300 light blue
+OK
+```
+
+### unmark
+
+Remove highlighting from a marked line.
+
+**Syntax:**
+```
+unmark <line_number>
+```
+
+**Arguments:**
+- `line_number`: 1-based line number
+
+**Response:**
+- `OK` on success
+- `ERROR line <N> is not marked` if the line wasn't marked
+- `ERROR line out of range: requested <N>, file has <M> lines` if line number is invalid
+
+**Examples:**
+```
+unmark 100
+OK
+
+unmark 999
+ERROR line 999 is not marked
+```
+
 ## Usage Examples
 
 ### Using netcat
@@ -116,6 +225,9 @@ Common errors:
 - `empty command` - No command provided
 - `unknown command: <cmd>` - Unrecognized command
 - `usage: goto <line_number>` - Missing argument for goto
+- `usage: mark <line_number> <color>` - Missing arguments for mark
+- `usage: unmark <line_number>` - Missing argument for unmark
 - `invalid line number: <value>` - Non-numeric line argument
 - `line number must be >= 1` - Line 0 is invalid
 - `line out of range: requested <N>, file has <M> lines` - Line beyond file end
+- `line <N> is not marked` - Trying to unmark a line that isn't marked
