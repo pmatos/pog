@@ -74,6 +74,10 @@ impl FileSource for MappedFile {
         self.line_offsets.len()
     }
 
+    fn file_size(&self) -> Result<u64> {
+        Ok(self.mmap.len() as u64)
+    }
+
     fn get_line(&self, line_num: usize) -> Result<Option<String>> {
         Ok(self.get_line_internal(line_num).map(|s| s.to_string()))
     }

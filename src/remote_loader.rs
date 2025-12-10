@@ -149,6 +149,34 @@ impl FileSource for RemoteFile {
         self.line_count
     }
 
+    fn file_size(&self) -> Result<u64> {
+        Self::with_retry(|| {
+            let output = Command::new("ssh")
+                .arg(&self.host)
+                .arg(format!("stat -c%s '{}'", self.path))
+                .output()?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(PogError::Ssh {
+                    host: self.host.clone(),
+                    message: stderr.to_string(),
+                });
+            }
+
+            let stdout = String::from_utf8(output.stdout)?;
+            let size: u64 = stdout
+                .trim()
+                .parse()
+                .map_err(|_| PogError::Ssh {
+                    host: self.host.clone(),
+                    message: format!("Invalid file size: {}", stdout.trim()),
+                })?;
+
+            Ok(size)
+        })
+    }
+
     fn get_line(&self, line_num: usize) -> Result<Option<String>> {
         if line_num >= self.line_count {
             return Ok(None);

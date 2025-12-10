@@ -7,16 +7,18 @@ mod remote_loader;
 mod server;
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use clap::Parser;
+use gtk4::gdk::Display;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
-    Adjustment, Application, ApplicationWindow, Label, Orientation, PolicyType, ScrolledWindow,
-    Box as GtkBox, Scrollbar,
+    Adjustment, Application, ApplicationWindow, CssProvider, Label, Orientation, PolicyType,
+    ScrolledWindow, Box as GtkBox, Scrollbar, STYLE_PROVIDER_PRIORITY_APPLICATION,
 };
 
 use commands::{CommandResponse, PogCommand};
@@ -173,6 +175,7 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
         .build();
 
     let total_lines = file_source.line_count();
+    let file_size = file_source.file_size().unwrap_or(0);
 
     let (command_tx, command_rx) = async_channel::unbounded::<CommandRequest>();
 
@@ -181,6 +184,18 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
             eprintln!("Failed to start command server: {}", e);
         }
     }
+
+    // CSS provider for dynamic line marking
+    let css_provider = CssProvider::new();
+    css_provider.load_from_string("");
+    gtk4::style_context_add_provider_for_display(
+        &Display::default().expect("Could not get default display"),
+        &css_provider,
+        STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+
+    // Marked lines: line_num (0-based) -> color
+    let marked_lines: Rc<RefCell<HashMap<usize, String>>> = Rc::new(RefCell::new(HashMap::new()));
 
     // Content box for log lines
     let content_box = GtkBox::new(Orientation::Vertical, 0);
@@ -225,6 +240,7 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
     let content_box_response = content_box.clone();
     let current_line_response = current_line.clone();
     let latest_request_id_response = latest_request_id.clone();
+    let marked_lines_response = marked_lines.clone();
 
     glib::spawn_future_local(async move {
         while let Ok(response) = response_rx.recv().await {
@@ -237,7 +253,7 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
                     let latest = *latest_request_id_response.borrow();
                     // Only display if this is the most recent request
                     if request_id == latest {
-                        populate_lines(&content_box_response, &lines);
+                        populate_lines(&content_box_response, &lines, &marked_lines_response.borrow());
                         *current_line_response.borrow_mut() = start;
                     }
                 }
@@ -250,6 +266,10 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
 
     // Command handler for socket server
     let v_adjustment_cmd = v_adjustment.clone();
+    let marked_lines_cmd = marked_lines.clone();
+    let css_provider_cmd = css_provider.clone();
+    let request_tx_cmd = request_tx.clone();
+    let latest_request_id_cmd = latest_request_id.clone();
     glib::spawn_future_local(async move {
         while let Ok(request) = command_rx.recv().await {
             let response = match request.command {
@@ -263,6 +283,63 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
                         let line_0based = (line - 1) as f64;
                         v_adjustment_cmd.set_value(line_0based);
                         CommandResponse::Ok(None)
+                    }
+                }
+                PogCommand::Lines => {
+                    CommandResponse::Ok(Some(total_lines.to_string()))
+                }
+                PogCommand::Top => {
+                    let top_line = v_adjustment_cmd.value() as usize + 1;
+                    CommandResponse::Ok(Some(top_line.to_string()))
+                }
+                PogCommand::Size => {
+                    CommandResponse::Ok(Some(file_size.to_string()))
+                }
+                PogCommand::Mark { line, color } => {
+                    if line == 0 || line > total_lines {
+                        CommandResponse::Error(format!(
+                            "line out of range: requested {}, file has {} lines",
+                            line, total_lines
+                        ))
+                    } else {
+                        let line_0based = line - 1;
+                        marked_lines_cmd.borrow_mut().insert(line_0based, color);
+                        update_marked_css(&css_provider_cmd, &marked_lines_cmd.borrow());
+                        // Trigger redraw
+                        let start = v_adjustment_cmd.value() as usize;
+                        let request_id = next_request_id();
+                        *latest_request_id_cmd.borrow_mut() = request_id;
+                        let _ = request_tx_cmd.send_blocking(FileRequest::GetLines {
+                            start,
+                            count: LINES_PER_PAGE,
+                            request_id,
+                        });
+                        CommandResponse::Ok(None)
+                    }
+                }
+                PogCommand::Unmark { line } => {
+                    if line == 0 || line > total_lines {
+                        CommandResponse::Error(format!(
+                            "line out of range: requested {}, file has {} lines",
+                            line, total_lines
+                        ))
+                    } else {
+                        let line_0based = line - 1;
+                        if marked_lines_cmd.borrow_mut().remove(&line_0based).is_some() {
+                            update_marked_css(&css_provider_cmd, &marked_lines_cmd.borrow());
+                            // Trigger redraw
+                            let start = v_adjustment_cmd.value() as usize;
+                            let request_id = next_request_id();
+                            *latest_request_id_cmd.borrow_mut() = request_id;
+                            let _ = request_tx_cmd.send_blocking(FileRequest::GetLines {
+                                start,
+                                count: LINES_PER_PAGE,
+                                request_id,
+                            });
+                            CommandResponse::Ok(None)
+                        } else {
+                            CommandResponse::Error(format!("line {} is not marked", line))
+                        }
                     }
                 }
             };
@@ -316,7 +393,18 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
     window.present();
 }
 
-fn populate_lines(content_box: &GtkBox, lines: &[(usize, String)]) {
+fn update_marked_css(css_provider: &CssProvider, marked_lines: &HashMap<usize, String>) {
+    let mut css = String::new();
+    for (line_num, color) in marked_lines {
+        css.push_str(&format!(
+            ".marked-line-{} {{ background-color: {}; }}\n",
+            line_num, color
+        ));
+    }
+    css_provider.load_from_string(&css);
+}
+
+fn populate_lines(content_box: &GtkBox, lines: &[(usize, String)], marked_lines: &HashMap<usize, String>) {
     // Clear
     while let Some(child) = content_box.first_child() {
         content_box.remove(&child);
@@ -327,7 +415,11 @@ fn populate_lines(content_box: &GtkBox, lines: &[(usize, String)]) {
         let label = Label::new(Some(&format!("{:8} │ {}", line_num + 1, text)));
         label.set_halign(gtk4::Align::Start);
         label.set_selectable(true);
-        label.set_css_classes(&["monospace"]);
+        if marked_lines.contains_key(line_num) {
+            label.set_css_classes(&["monospace", &format!("marked-line-{}", line_num)]);
+        } else {
+            label.set_css_classes(&["monospace"]);
+        }
         content_box.append(&label);
     }
 }

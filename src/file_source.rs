@@ -4,6 +4,9 @@ pub trait FileSource: Send + Sync {
     /// Returns total number of lines in the file
     fn line_count(&self) -> usize;
 
+    /// Returns file size in bytes
+    fn file_size(&self) -> Result<u64>;
+
     /// Get a single line by 0-based line number
     #[allow(dead_code)]
     fn get_line(&self, line_num: usize) -> Result<Option<String>>;
