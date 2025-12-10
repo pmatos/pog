@@ -287,15 +287,17 @@ search-next
 ```
 
 **Response:**
-- `OK` on success (view navigates to the match)
+- `OK <line> <column> <length>` - Match location (1-based line and column, match length in characters)
 - `ERROR no active search` - If no search has been started
 - `ERROR no more matches` - If there are no more matches forward
 
 **Examples:**
 ```
 search-next
-OK
+OK 12345 10 7
 ```
+
+The response `OK 12345 10 7` means: match found at line 12345, starting at column 10, with length 7 characters.
 
 ### search-prev
 
@@ -307,15 +309,17 @@ search-prev
 ```
 
 **Response:**
-- `OK` on success (view navigates to the match)
+- `OK <line> <column> <length>` - Match location (1-based line and column, match length in characters)
 - `ERROR no active search` - If no search has been started
 - `ERROR no more matches` - If there are no more matches backward
 
 **Examples:**
 ```
 search-prev
-OK
+OK 35655226 45 7
 ```
+
+The response `OK 35655226 45 7` means: match found at line 35655226, starting at column 45, with length 7 characters.
 
 ### search-clear
 

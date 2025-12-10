@@ -95,7 +95,6 @@ const SEARCH_BUFFER_LINES: usize = 100;
 const SEARCH_HIGHLIGHT_COLOR: &str = "#FFD700";
 const SEARCH_CHUNK_SIZE: usize = 1000;
 
-#[derive(Debug)]
 enum FileRequest {
     GetLines {
         start: usize,
@@ -114,6 +113,8 @@ enum FileRequest {
         from_line: usize,
         direction: SearchDirection,
         request_id: u64,
+        // Channel to send back match info (line, col, len) for synchronous socket response
+        result_tx: Option<std::sync::mpsc::Sender<Option<(usize, usize, usize)>>>,
     },
 }
 
@@ -214,6 +215,7 @@ fn spawn_file_worker(
                     from_line,
                     direction,
                     request_id,
+                    result_tx,
                 } => {
                     match regex::Regex::new(&pattern) {
                         Ok(regex) => {
@@ -267,6 +269,14 @@ fn spawn_file_worker(
                                 }
                             }
 
+                            // Send result through sync channel if provided (for socket commands)
+                            if let Some(tx) = result_tx {
+                                let result = found.as_ref().map(|m| {
+                                    (m.line_num, m.start_col, m.end_col - m.start_col)
+                                });
+                                let _ = tx.send(result);
+                            }
+
                             let _ = response_tx.send_blocking(FileResponse::FoundMatch {
                                 match_info: found,
                                 line_num: found_line,
@@ -274,6 +284,10 @@ fn spawn_file_worker(
                             });
                         }
                         Err(e) => {
+                            // Send error through sync channel if provided
+                            if let Some(tx) = result_tx {
+                                let _ = tx.send(None);
+                            }
                             let _ = response_tx.send_blocking(FileResponse::Error {
                                 message: format!("invalid regex: {}", e),
                             });
@@ -690,13 +704,21 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
                         let current_line = v_adjustment_cmd.value() as usize;
                         drop(state);
 
+                        let (result_tx, result_rx) = std::sync::mpsc::channel();
                         let _ = request_tx_cmd.send_blocking(FileRequest::FindNextMatch {
                             pattern,
                             from_line: current_line,
                             direction: SearchDirection::Forward,
                             request_id: next_request_id(),
+                            result_tx: Some(result_tx),
                         });
-                        CommandResponse::Ok(None)
+                        match result_rx.recv() {
+                            Ok(Some((line, col, len))) => {
+                                CommandResponse::Ok(Some(format!("{} {} {}", line + 1, col + 1, len)))
+                            }
+                            Ok(None) => CommandResponse::Error("no more matches".to_string()),
+                            Err(_) => CommandResponse::Error("search failed".to_string()),
+                        }
                     }
                 }
                 PogCommand::SearchPrev => {
@@ -710,13 +732,21 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
                         let current_line = v_adjustment_cmd.value() as usize;
                         drop(state);
 
+                        let (result_tx, result_rx) = std::sync::mpsc::channel();
                         let _ = request_tx_cmd.send_blocking(FileRequest::FindNextMatch {
                             pattern,
                             from_line: current_line,
                             direction: SearchDirection::Backward,
                             request_id: next_request_id(),
+                            result_tx: Some(result_tx),
                         });
-                        CommandResponse::Ok(None)
+                        match result_rx.recv() {
+                            Ok(Some((line, col, len))) => {
+                                CommandResponse::Ok(Some(format!("{} {} {}", line + 1, col + 1, len)))
+                            }
+                            Ok(None) => CommandResponse::Error("no more matches".to_string()),
+                            Err(_) => CommandResponse::Error("search failed".to_string()),
+                        }
                     }
                 }
                 PogCommand::SearchClear => {
@@ -885,6 +915,7 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
                     from_line: current_line,
                     direction,
                     request_id,
+                    result_tx: None,  // UI doesn't need sync response
                 });
             }
             return glib::Propagation::Stop;
