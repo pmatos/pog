@@ -204,9 +204,12 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
         }
     }
 
-    // CSS provider for dynamic line marking
+    // CSS provider for styling
     let css_provider = CssProvider::new();
-    css_provider.load_from_string("");
+    css_provider.load_from_string(
+        ".line-numbers-sidebar { background-color: #2a2a2a; padding-right: 8px; }
+         .line-number { color: #888; }"
+    );
     gtk4::style_context_add_provider_for_display(
         &Display::default().expect("Could not get default display"),
         &css_provider,
@@ -215,6 +218,14 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
 
     // Marked lines: line_num (0-based) -> markings (full-line color and/or regions)
     let marked_lines: Rc<RefCell<HashMap<usize, LineMarkings>>> = Rc::new(RefCell::new(HashMap::new()));
+
+    // Line numbers sidebar
+    let line_numbers_box = GtkBox::new(Orientation::Vertical, 0);
+    line_numbers_box.set_width_request(80);
+    line_numbers_box.set_css_classes(&["line-numbers-sidebar"]);
+
+    // Separator between line numbers and content
+    let separator = gtk4::Separator::new(Orientation::Vertical);
 
     // Content box for log lines
     let content_box = GtkBox::new(Orientation::Vertical, 0);
@@ -244,6 +255,8 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
 
     // Layout
     let hbox = GtkBox::new(Orientation::Horizontal, 0);
+    hbox.append(&line_numbers_box);
+    hbox.append(&separator);
     hbox.append(&h_scroll);
     hbox.append(&v_scrollbar);
 
@@ -256,6 +269,7 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
     spawn_file_worker(file_source, request_rx, response_tx);
 
     // Response handler
+    let line_numbers_box_response = line_numbers_box.clone();
     let content_box_response = content_box.clone();
     let current_line_response = current_line.clone();
     let latest_request_id_response = latest_request_id.clone();
@@ -272,7 +286,7 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
                     let latest = *latest_request_id_response.borrow();
                     // Only display if this is the most recent request
                     if request_id == latest {
-                        populate_lines(&content_box_response, &lines, &marked_lines_response.borrow());
+                        populate_lines(&line_numbers_box_response, &content_box_response, &lines, &marked_lines_response.borrow());
                         *current_line_response.borrow_mut() = start;
                     }
                 }
@@ -521,21 +535,33 @@ fn apply_markings(text: &str, markings: &LineMarkings) -> String {
     result
 }
 
-fn populate_lines(content_box: &GtkBox, lines: &[(usize, String)], marked_lines: &HashMap<usize, LineMarkings>) {
-    // Clear
+fn populate_lines(
+    line_numbers_box: &GtkBox,
+    content_box: &GtkBox,
+    lines: &[(usize, String)],
+    marked_lines: &HashMap<usize, LineMarkings>,
+) {
+    // Clear both boxes
+    while let Some(child) = line_numbers_box.first_child() {
+        line_numbers_box.remove(&child);
+    }
     while let Some(child) = content_box.first_child() {
         content_box.remove(&child);
     }
 
     // Add lines
     for (line_num, text) in lines {
-        let line_prefix = format!("{:8} │ ", line_num + 1);
+        // Line number label (sidebar)
+        let num_label = Label::new(Some(&format!("{:>8}", line_num + 1)));
+        num_label.set_halign(gtk4::Align::End);
+        num_label.set_css_classes(&["monospace", "line-number"]);
+        line_numbers_box.append(&num_label);
 
+        // Content label
         let display_text = if let Some(markings) = marked_lines.get(line_num) {
-            let marked_content = apply_markings(text, markings);
-            format!("{}{}", glib::markup_escape_text(&line_prefix), marked_content)
+            apply_markings(text, markings)
         } else {
-            glib::markup_escape_text(&format!("{}{}", line_prefix, text)).to_string()
+            glib::markup_escape_text(text).to_string()
         };
 
         let label = Label::new(None);
