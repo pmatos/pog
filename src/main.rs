@@ -27,6 +27,25 @@ use file_source::FileSource;
 use remote_loader::RemoteFile;
 use server::CommandRequest;
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct Region {
+    pub start_col: usize,  // 0-based
+    pub end_col: usize,    // exclusive
+    pub color: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LineMarkings {
+    pub full_line_color: Option<String>,
+    pub regions: Vec<Region>,
+}
+
+impl LineMarkings {
+    pub fn is_empty(&self) -> bool {
+        self.full_line_color.is_none() && self.regions.is_empty()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum FilePath {
     Local(std::path::PathBuf),
@@ -194,8 +213,8 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
         STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
 
-    // Marked lines: line_num (0-based) -> color
-    let marked_lines: Rc<RefCell<HashMap<usize, String>>> = Rc::new(RefCell::new(HashMap::new()));
+    // Marked lines: line_num (0-based) -> markings (full-line color and/or regions)
+    let marked_lines: Rc<RefCell<HashMap<usize, LineMarkings>>> = Rc::new(RefCell::new(HashMap::new()));
 
     // Content box for log lines
     let content_box = GtkBox::new(Orientation::Vertical, 0);
@@ -267,7 +286,6 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
     // Command handler for socket server
     let v_adjustment_cmd = v_adjustment.clone();
     let marked_lines_cmd = marked_lines.clone();
-    let css_provider_cmd = css_provider.clone();
     let request_tx_cmd = request_tx.clone();
     let latest_request_id_cmd = latest_request_id.clone();
     glib::spawn_future_local(async move {
@@ -295,7 +313,7 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
                 PogCommand::Size => {
                     CommandResponse::Ok(Some(file_size.to_string()))
                 }
-                PogCommand::Mark { line, color } => {
+                PogCommand::Mark { line, region, color } => {
                     if line == 0 || line > total_lines {
                         CommandResponse::Error(format!(
                             "line out of range: requested {}, file has {} lines",
@@ -303,8 +321,31 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
                         ))
                     } else {
                         let line_0based = line - 1;
-                        marked_lines_cmd.borrow_mut().insert(line_0based, color);
-                        update_marked_css(&css_provider_cmd, &marked_lines_cmd.borrow());
+                        let mut marks = marked_lines_cmd.borrow_mut();
+                        let entry = marks.entry(line_0based).or_default();
+
+                        match region {
+                            None => {
+                                // Full line mark
+                                entry.full_line_color = Some(color);
+                            }
+                            Some((start, end)) => {
+                                // Region mark - convert to 0-based
+                                let start_0based = start - 1;
+                                let end_0based = end - 1;
+                                // Remove overlapping regions
+                                entry.regions.retain(|r| r.end_col <= start_0based || r.start_col >= end_0based);
+                                entry.regions.push(Region {
+                                    start_col: start_0based,
+                                    end_col: end_0based,
+                                    color,
+                                });
+                                // Sort regions by start column
+                                entry.regions.sort_by_key(|r| r.start_col);
+                            }
+                        }
+                        drop(marks);
+
                         // Trigger redraw
                         let start = v_adjustment_cmd.value() as usize;
                         let request_id = next_request_id();
@@ -317,7 +358,7 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
                         CommandResponse::Ok(None)
                     }
                 }
-                PogCommand::Unmark { line } => {
+                PogCommand::Unmark { line, region } => {
                     if line == 0 || line > total_lines {
                         CommandResponse::Error(format!(
                             "line out of range: requested {}, file has {} lines",
@@ -325,8 +366,34 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
                         ))
                     } else {
                         let line_0based = line - 1;
-                        if marked_lines_cmd.borrow_mut().remove(&line_0based).is_some() {
-                            update_marked_css(&css_provider_cmd, &marked_lines_cmd.borrow());
+                        let mut marks = marked_lines_cmd.borrow_mut();
+
+                        let removed = match region {
+                            None => {
+                                // Remove all marks from line
+                                marks.remove(&line_0based).is_some()
+                            }
+                            Some((start, end)) => {
+                                // Remove specific region (convert to 0-based)
+                                let start_0based = start - 1;
+                                let end_0based = end - 1;
+                                if let Some(entry) = marks.get_mut(&line_0based) {
+                                    let before_len = entry.regions.len();
+                                    entry.regions.retain(|r| r.start_col != start_0based || r.end_col != end_0based);
+                                    let removed = entry.regions.len() != before_len;
+                                    // Clean up empty entries
+                                    if entry.is_empty() {
+                                        marks.remove(&line_0based);
+                                    }
+                                    removed
+                                } else {
+                                    false
+                                }
+                            }
+                        };
+                        drop(marks);
+
+                        if removed {
                             // Trigger redraw
                             let start = v_adjustment_cmd.value() as usize;
                             let request_id = next_request_id();
@@ -393,18 +460,68 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
     window.present();
 }
 
-fn update_marked_css(css_provider: &CssProvider, marked_lines: &HashMap<usize, String>) {
-    let mut css = String::new();
-    for (line_num, color) in marked_lines {
-        css.push_str(&format!(
-            ".marked-line-{} {{ background-color: {}; }}\n",
-            line_num, color
-        ));
+fn apply_markings(text: &str, markings: &LineMarkings) -> String {
+    let chars: Vec<char> = text.chars().collect();
+
+    // If there's a full-line color and no regions, wrap everything
+    if let Some(ref color) = markings.full_line_color {
+        if markings.regions.is_empty() {
+            return format!(
+                "<span background=\"{}\">{}</span>",
+                glib::markup_escape_text(color),
+                glib::markup_escape_text(text)
+            );
+        }
     }
-    css_provider.load_from_string(&css);
+
+    // Build character-level color map
+    let mut char_colors: Vec<Option<&str>> = vec![None; chars.len()];
+
+    // Full line color applies to all characters first (as background)
+    if let Some(ref color) = markings.full_line_color {
+        for slot in &mut char_colors {
+            *slot = Some(color.as_str());
+        }
+    }
+
+    // Region colors override (regions are sorted by start_col)
+    for region in &markings.regions {
+        for i in region.start_col..region.end_col.min(chars.len()) {
+            char_colors[i] = Some(&region.color);
+        }
+    }
+
+    // Generate markup by grouping consecutive characters with same color
+    let mut result = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let current_color = char_colors[i];
+        let mut end = i + 1;
+        while end < chars.len() && char_colors[end] == current_color {
+            end += 1;
+        }
+
+        let segment: String = chars[i..end].iter().collect();
+        let escaped = glib::markup_escape_text(&segment);
+
+        if let Some(color) = current_color {
+            result.push_str(&format!(
+                "<span background=\"{}\">",
+                glib::markup_escape_text(color)
+            ));
+            result.push_str(&escaped);
+            result.push_str("</span>");
+        } else {
+            result.push_str(&escaped);
+        }
+
+        i = end;
+    }
+
+    result
 }
 
-fn populate_lines(content_box: &GtkBox, lines: &[(usize, String)], marked_lines: &HashMap<usize, String>) {
+fn populate_lines(content_box: &GtkBox, lines: &[(usize, String)], marked_lines: &HashMap<usize, LineMarkings>) {
     // Clear
     while let Some(child) = content_box.first_child() {
         content_box.remove(&child);
@@ -412,14 +529,21 @@ fn populate_lines(content_box: &GtkBox, lines: &[(usize, String)], marked_lines:
 
     // Add lines
     for (line_num, text) in lines {
-        let label = Label::new(Some(&format!("{:8} │ {}", line_num + 1, text)));
+        let line_prefix = format!("{:8} │ ", line_num + 1);
+
+        let display_text = if let Some(markings) = marked_lines.get(line_num) {
+            let marked_content = apply_markings(text, markings);
+            format!("{}{}", glib::markup_escape_text(&line_prefix), marked_content)
+        } else {
+            glib::markup_escape_text(&format!("{}{}", line_prefix, text)).to_string()
+        };
+
+        let label = Label::new(None);
+        label.set_markup(&display_text);
+        label.set_use_markup(true);
         label.set_halign(gtk4::Align::Start);
         label.set_selectable(true);
-        if marked_lines.contains_key(line_num) {
-            label.set_css_classes(&["monospace", &format!("marked-line-{}", line_num)]);
-        } else {
-            label.set_css_classes(&["monospace"]);
-        }
+        label.set_css_classes(&["monospace"]);
         content_box.append(&label);
     }
 }

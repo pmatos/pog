@@ -122,20 +122,25 @@ OK 52428800
 
 ### mark
 
-Highlight a specific line with a color.
+Highlight a specific line or column range with a color.
 
 **Syntax:**
 ```
 mark <line_number> <color>
+mark <line_number> <start_col>-<end_col> <color>
 ```
 
 **Arguments:**
 - `line_number`: 1-based line number
+- `start_col`: 1-based starting column (inclusive)
+- `end_col`: 1-based ending column (exclusive)
 - `color`: Any valid CSS color (named colors like `red`, `blue`, or hex codes like `#FF0000`)
 
 **Response:**
 - `OK` on success
 - `ERROR line out of range: requested <N>, file has <M> lines` if line number is invalid
+- `ERROR column numbers must be >= 1` if column is 0
+- `ERROR start column must be less than end column` if range is invalid
 
 **Examples:**
 ```
@@ -147,23 +152,37 @@ OK
 
 mark 300 light blue
 OK
+
+mark 100 5-20 yellow
+OK
+
+mark 100 1-10 #FF0000
+OK
 ```
+
+**Notes:**
+- Multiple regions can be marked on the same line with different colors
+- Region marks override full-line marks where they overlap
+- Column ranges are 1-based, with end column being exclusive
 
 ### unmark
 
-Remove highlighting from a marked line.
+Remove highlighting from a marked line or specific region.
 
 **Syntax:**
 ```
 unmark <line_number>
+unmark <line_number> <start_col>-<end_col>
 ```
 
 **Arguments:**
 - `line_number`: 1-based line number
+- `start_col`: 1-based starting column (must match exactly)
+- `end_col`: 1-based ending column (must match exactly)
 
 **Response:**
 - `OK` on success
-- `ERROR line <N> is not marked` if the line wasn't marked
+- `ERROR line <N> is not marked` if the line/region wasn't marked
 - `ERROR line out of range: requested <N>, file has <M> lines` if line number is invalid
 
 **Examples:**
@@ -171,9 +190,16 @@ unmark <line_number>
 unmark 100
 OK
 
+unmark 100 5-20
+OK
+
 unmark 999
 ERROR line 999 is not marked
 ```
+
+**Notes:**
+- `unmark <line>` removes all marks (full-line and all regions) from that line
+- `unmark <line> <start>-<end>` removes only the specific region with matching bounds
 
 ## Usage Examples
 
@@ -225,9 +251,11 @@ Common errors:
 - `empty command` - No command provided
 - `unknown command: <cmd>` - Unrecognized command
 - `usage: goto <line_number>` - Missing argument for goto
-- `usage: mark <line_number> <color>` - Missing arguments for mark
-- `usage: unmark <line_number>` - Missing argument for unmark
+- `usage: mark <line_number> [<start>-<end>] <color>` - Missing arguments for mark
+- `usage: unmark <line_number> [<start>-<end>]` - Missing argument for unmark
 - `invalid line number: <value>` - Non-numeric line argument
 - `line number must be >= 1` - Line 0 is invalid
+- `column numbers must be >= 1` - Column 0 is invalid
+- `start column must be less than end column` - Invalid column range
 - `line out of range: requested <N>, file has <M> lines` - Line beyond file end
 - `line <N> is not marked` - Trying to unmark a line that isn't marked

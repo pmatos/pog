@@ -6,8 +6,15 @@ pub enum PogCommand {
     Lines,
     Top,
     Size,
-    Mark { line: usize, color: String },
-    Unmark { line: usize },
+    Mark {
+        line: usize,
+        region: Option<(usize, usize)>,  // (start_col, end_col) 1-based from user
+        color: String,
+    },
+    Unmark {
+        line: usize,
+        region: Option<(usize, usize)>,  // Optional: specific region to unmark
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -67,7 +74,7 @@ pub fn parse_command(input: &str) -> Result<PogCommand, String> {
         }
         "mark" => {
             if parts.len() < 3 {
-                return Err("usage: mark <line_number> <color>".to_string());
+                return Err("usage: mark <line_number> [<start>-<end>] <color>".to_string());
             }
             let line: usize = parts[1]
                 .parse()
@@ -75,12 +82,35 @@ pub fn parse_command(input: &str) -> Result<PogCommand, String> {
             if line == 0 {
                 return Err("line number must be >= 1".to_string());
             }
+
+            // Check if parts[2] looks like a range (contains '-' and numeric on both sides)
+            if let Some((start_str, end_str)) = parts[2].split_once('-') {
+                if let (Ok(start), Ok(end)) = (start_str.parse::<usize>(), end_str.parse::<usize>()) {
+                    // It's a region mark
+                    if parts.len() < 4 {
+                        return Err("usage: mark <line_number> <start>-<end> <color>".to_string());
+                    }
+                    if start == 0 || end == 0 {
+                        return Err("column numbers must be >= 1".to_string());
+                    }
+                    if start >= end {
+                        return Err("start column must be less than end column".to_string());
+                    }
+                    let color = parts[3..].join(" ");
+                    return Ok(PogCommand::Mark {
+                        line,
+                        region: Some((start, end)),
+                        color,
+                    });
+                }
+            }
+            // Fall through: it's a full-line mark
             let color = parts[2..].join(" ");
-            Ok(PogCommand::Mark { line, color })
+            Ok(PogCommand::Mark { line, region: None, color })
         }
         "unmark" => {
-            if parts.len() != 2 {
-                return Err("usage: unmark <line_number>".to_string());
+            if parts.len() < 2 {
+                return Err("usage: unmark <line_number> [<start>-<end>]".to_string());
             }
             let line: usize = parts[1]
                 .parse()
@@ -88,7 +118,25 @@ pub fn parse_command(input: &str) -> Result<PogCommand, String> {
             if line == 0 {
                 return Err("line number must be >= 1".to_string());
             }
-            Ok(PogCommand::Unmark { line })
+
+            let region = if parts.len() >= 3 {
+                if let Some((start_str, end_str)) = parts[2].split_once('-') {
+                    if let (Ok(start), Ok(end)) = (start_str.parse::<usize>(), end_str.parse::<usize>()) {
+                        if start == 0 || end == 0 {
+                            return Err("column numbers must be >= 1".to_string());
+                        }
+                        Some((start, end))
+                    } else {
+                        return Err(format!("invalid range: {}", parts[2]));
+                    }
+                } else {
+                    return Err(format!("invalid range format: {}", parts[2]));
+                }
+            } else {
+                None
+            };
+
+            Ok(PogCommand::Unmark { line, region })
         }
         cmd => Err(format!("unknown command: {}", cmd)),
     }
@@ -138,17 +186,18 @@ mod tests {
 
     #[test]
     fn test_parse_mark() {
+        // Full-line marks
         assert_eq!(
             parse_command("mark 10 red"),
-            Ok(PogCommand::Mark { line: 10, color: "red".to_string() })
+            Ok(PogCommand::Mark { line: 10, region: None, color: "red".to_string() })
         );
         assert_eq!(
             parse_command("MARK 5 #FF0000"),
-            Ok(PogCommand::Mark { line: 5, color: "#FF0000".to_string() })
+            Ok(PogCommand::Mark { line: 5, region: None, color: "#FF0000".to_string() })
         );
         assert_eq!(
             parse_command("mark 1 light blue"),
-            Ok(PogCommand::Mark { line: 1, color: "light blue".to_string() })
+            Ok(PogCommand::Mark { line: 1, region: None, color: "light blue".to_string() })
         );
         assert!(parse_command("mark").is_err());
         assert!(parse_command("mark 10").is_err());
@@ -157,13 +206,53 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_mark_region() {
+        // Region marks
+        assert_eq!(
+            parse_command("mark 10 5-20 red"),
+            Ok(PogCommand::Mark { line: 10, region: Some((5, 20)), color: "red".to_string() })
+        );
+        assert_eq!(
+            parse_command("mark 100 1-50 #FF0000"),
+            Ok(PogCommand::Mark { line: 100, region: Some((1, 50)), color: "#FF0000".to_string() })
+        );
+        assert_eq!(
+            parse_command("mark 1 10-20 light blue"),
+            Ok(PogCommand::Mark { line: 1, region: Some((10, 20)), color: "light blue".to_string() })
+        );
+        // Error cases
+        assert!(parse_command("mark 10 0-5 red").is_err());   // column 0 invalid
+        assert!(parse_command("mark 10 5-0 red").is_err());   // column 0 invalid
+        assert!(parse_command("mark 10 5-5 red").is_err());   // start >= end
+        assert!(parse_command("mark 10 10-5 red").is_err());  // start > end
+        assert!(parse_command("mark 10 5-20").is_err());      // missing color
+    }
+
+    #[test]
     fn test_parse_unmark() {
-        assert_eq!(parse_command("unmark 10"), Ok(PogCommand::Unmark { line: 10 }));
-        assert_eq!(parse_command("UNMARK 1"), Ok(PogCommand::Unmark { line: 1 }));
+        // Full-line unmark
+        assert_eq!(parse_command("unmark 10"), Ok(PogCommand::Unmark { line: 10, region: None }));
+        assert_eq!(parse_command("UNMARK 1"), Ok(PogCommand::Unmark { line: 1, region: None }));
         assert!(parse_command("unmark").is_err());
         assert!(parse_command("unmark abc").is_err());
         assert!(parse_command("unmark 0").is_err());
-        assert!(parse_command("unmark 10 extra").is_err());
+    }
+
+    #[test]
+    fn test_parse_unmark_region() {
+        // Region unmark
+        assert_eq!(
+            parse_command("unmark 10 5-20"),
+            Ok(PogCommand::Unmark { line: 10, region: Some((5, 20)) })
+        );
+        assert_eq!(
+            parse_command("unmark 100 1-50"),
+            Ok(PogCommand::Unmark { line: 100, region: Some((1, 50)) })
+        );
+        // Error cases
+        assert!(parse_command("unmark 10 0-5").is_err());    // column 0 invalid
+        assert!(parse_command("unmark 10 abc").is_err());   // invalid range format
+        assert!(parse_command("unmark 10 5").is_err());     // not a range
     }
 
     #[test]

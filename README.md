@@ -9,6 +9,8 @@ A fast log file viewer built with Rust and GTK4. Supports both local and remote 
 - **Virtual scrolling** - only fetches and renders visible lines
 - **Line numbers** displayed alongside content
 - **Mouse wheel scrolling** and scrollbar navigation
+- **Socket-based control** via TCP for external scripting
+- **Line and region marking** - highlight full lines or specific column ranges
 
 ## Installation
 
@@ -34,6 +36,26 @@ pog user@host:/path/to/file.log
 - Rust 1.70+
 - GTK4 development libraries
 - For remote files: SSH client with key-based authentication configured
+
+## Socket Commands
+
+pog includes a TCP server (default port 9876) for programmatic control:
+
+```bash
+# Navigate to line 100
+echo "goto 100" | nc localhost 9876
+
+# Mark a full line
+echo "mark 50 red" | nc localhost 9876
+
+# Mark a column range (columns 10-20 on line 50)
+echo "mark 50 10-20 yellow" | nc localhost 9876
+
+# Remove marking
+echo "unmark 50" | nc localhost 9876
+```
+
+See [doc/pog-lang.md](doc/pog-lang.md) for the full protocol reference.
 
 ## How It Works
 
