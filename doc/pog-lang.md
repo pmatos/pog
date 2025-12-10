@@ -120,6 +120,41 @@ size
 OK 52428800
 ```
 
+### cursor
+
+Get or set the cursor position. The cursor is used by search-next/search-prev to determine where to search from. The `goto` command also updates the cursor position.
+
+**Syntax:**
+```
+cursor
+cursor <line_number>
+```
+
+**Arguments:**
+- `line_number`: Optional 1-based line number to set cursor position
+
+**Response:**
+- `OK <line_number>` - Current cursor position (when getting)
+- `OK` - Success (when setting)
+- `ERROR line out of range: requested <N>, file has <M> lines` - If line number is invalid
+
+**Examples:**
+```
+cursor
+OK 1
+
+cursor 35655272
+OK
+
+cursor
+OK 35655272
+```
+
+**Notes:**
+- The cursor starts at line 1
+- `goto` automatically updates the cursor to the target line
+- `search-next` and `search-prev` search from the cursor position and update it when a match is found
+
 ### mark
 
 Highlight a specific line or column range with a color.

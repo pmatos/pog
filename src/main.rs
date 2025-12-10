@@ -377,6 +377,9 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
     // Search state
     let search_state: Rc<RefCell<SearchState>> = Rc::new(RefCell::new(SearchState::new()));
 
+    // Cursor position (0-based line number for search operations)
+    let cursor_position: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
+
     // Line numbers sidebar
     let line_numbers_box = GtkBox::new(Orientation::Vertical, 0);
     line_numbers_box.set_width_request(80);
@@ -544,6 +547,7 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
     let search_box_cmd = search_box.clone();
     let search_entry_cmd = search_entry.clone();
     let search_info_cmd = search_info.clone();
+    let cursor_position_cmd = cursor_position.clone();
     glib::spawn_future_local(async move {
         while let Ok(request) = command_rx.recv().await {
             let response = match request.command {
@@ -554,8 +558,9 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
                             line, total_lines
                         ))
                     } else {
-                        let line_0based = (line - 1) as f64;
-                        v_adjustment_cmd.set_value(line_0based);
+                        let line_0based = line - 1;
+                        v_adjustment_cmd.set_value(line_0based as f64);
+                        *cursor_position_cmd.borrow_mut() = line_0based;
                         CommandResponse::Ok(None)
                     }
                 }
@@ -568,6 +573,25 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
                 }
                 PogCommand::Size => {
                     CommandResponse::Ok(Some(file_size.to_string()))
+                }
+                PogCommand::Cursor { line } => {
+                    match line {
+                        None => {
+                            let pos = *cursor_position_cmd.borrow() + 1;  // Return 1-based
+                            CommandResponse::Ok(Some(pos.to_string()))
+                        }
+                        Some(l) => {
+                            if l == 0 || l > total_lines {
+                                CommandResponse::Error(format!(
+                                    "line out of range: requested {}, file has {} lines",
+                                    l, total_lines
+                                ))
+                            } else {
+                                *cursor_position_cmd.borrow_mut() = l - 1;  // Store 0-based
+                                CommandResponse::Ok(None)
+                            }
+                        }
+                    }
                 }
                 PogCommand::Mark { line, region, color } => {
                     if line == 0 || line > total_lines {
@@ -701,7 +725,7 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
                         CommandResponse::Error("no search pattern".to_string())
                     } else {
                         let pattern = state.pattern_str.clone();
-                        let current_line = v_adjustment_cmd.value() as usize;
+                        let current_line = *cursor_position_cmd.borrow();
                         drop(state);
 
                         let (result_tx, result_rx) = std::sync::mpsc::channel();
@@ -714,6 +738,7 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
                         });
                         match result_rx.recv() {
                             Ok(Some((line, col, len))) => {
+                                *cursor_position_cmd.borrow_mut() = line;
                                 CommandResponse::Ok(Some(format!("{} {} {}", line + 1, col + 1, len)))
                             }
                             Ok(None) => CommandResponse::Error("no more matches".to_string()),
@@ -729,7 +754,7 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
                         CommandResponse::Error("no search pattern".to_string())
                     } else {
                         let pattern = state.pattern_str.clone();
-                        let current_line = v_adjustment_cmd.value() as usize;
+                        let current_line = *cursor_position_cmd.borrow();
                         drop(state);
 
                         let (result_tx, result_rx) = std::sync::mpsc::channel();
@@ -742,6 +767,7 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
                         });
                         match result_rx.recv() {
                             Ok(Some((line, col, len))) => {
+                                *cursor_position_cmd.borrow_mut() = line;
                                 CommandResponse::Ok(Some(format!("{} {} {}", line + 1, col + 1, len)))
                             }
                             Ok(None) => CommandResponse::Error("no more matches".to_string()),

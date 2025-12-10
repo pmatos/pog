@@ -6,6 +6,7 @@ pub enum PogCommand {
     Lines,
     Top,
     Size,
+    Cursor { line: Option<usize> },  // None = get cursor, Some = set cursor
     Mark {
         line: usize,
         region: Option<(usize, usize)>,  // (start_col, end_col) 1-based from user
@@ -75,6 +76,21 @@ pub fn parse_command(input: &str) -> Result<PogCommand, String> {
                 return Err("usage: size".to_string());
             }
             Ok(PogCommand::Size)
+        }
+        "cursor" => {
+            if parts.len() == 1 {
+                Ok(PogCommand::Cursor { line: None })
+            } else if parts.len() == 2 {
+                let line: usize = parts[1]
+                    .parse()
+                    .map_err(|_| format!("invalid line number: {}", parts[1]))?;
+                if line == 0 {
+                    return Err("line number must be >= 1".to_string());
+                }
+                Ok(PogCommand::Cursor { line: Some(line) })
+            } else {
+                Err("usage: cursor [line_number]".to_string())
+            }
         }
         "mark" => {
             if parts.len() < 3 {
@@ -307,6 +323,17 @@ mod tests {
             format!("{}", CommandResponse::Error("failed".to_string())),
             "ERROR failed"
         );
+    }
+
+    #[test]
+    fn test_parse_cursor() {
+        assert_eq!(parse_command("cursor"), Ok(PogCommand::Cursor { line: None }));
+        assert_eq!(parse_command("CURSOR"), Ok(PogCommand::Cursor { line: None }));
+        assert_eq!(parse_command("cursor 100"), Ok(PogCommand::Cursor { line: Some(100) }));
+        assert_eq!(parse_command("cursor 1"), Ok(PogCommand::Cursor { line: Some(1) }));
+        assert!(parse_command("cursor 0").is_err());
+        assert!(parse_command("cursor abc").is_err());
+        assert!(parse_command("cursor 1 2").is_err());
     }
 
     #[test]
