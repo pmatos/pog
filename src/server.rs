@@ -10,12 +10,35 @@ pub struct CommandRequest {
     pub response_tx: mpsc::Sender<CommandResponse>,
 }
 
+const MAX_PORT_ATTEMPTS: u16 = 100;
+
+fn try_bind_port(starting_port: u16) -> std::io::Result<(TcpListener, u16)> {
+    for offset in 0..MAX_PORT_ATTEMPTS {
+        let port = starting_port.saturating_add(offset);
+        match TcpListener::bind(format!("127.0.0.1:{}", port)) {
+            Ok(listener) => return Ok((listener, port)),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AddrInUse,
+        format!(
+            "could not find available port in range {}-{}",
+            starting_port,
+            starting_port.saturating_add(MAX_PORT_ATTEMPTS - 1)
+        ),
+    ))
+}
+
 pub fn start_server(
     port: u16,
     command_tx: async_channel::Sender<CommandRequest>,
 ) -> std::io::Result<JoinHandle<()>> {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))?;
-    eprintln!("pog server listening on 127.0.0.1:{}", port);
+    let (listener, actual_port) = try_bind_port(port)?;
+    eprintln!("pog server listening on 127.0.0.1:{}", actual_port);
 
     let handle = thread::spawn(move || {
         for stream in listener.incoming() {

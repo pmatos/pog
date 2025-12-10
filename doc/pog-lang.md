@@ -240,6 +240,101 @@ sleep 1
 send_command "goto 500"
 ```
 
+### search
+
+Start a regex search and highlight matches in the viewport.
+
+**Syntax:**
+```
+search <regex_pattern>
+```
+
+**Arguments:**
+- `regex_pattern`: A valid Rust regex pattern
+
+**Response:**
+- `OK <count>` - The number of matches found in the current viewport
+- `ERROR invalid regex: <details>` - If the pattern is not a valid regex
+
+**Examples:**
+```
+search error
+OK 5
+
+search ERROR|WARN
+OK 12
+
+search [0-9]{4}-[0-9]{2}-[0-9]{2}
+OK 3
+
+search (invalid
+ERROR invalid regex: regex parse error: ...
+```
+
+**Notes:**
+- Search is viewport-only with a buffer around visible lines for efficiency
+- Matches are automatically highlighted with a gold color
+- The view navigates to the first match
+- Search highlights coexist with manual marks (marks take precedence)
+
+### search-next
+
+Navigate to the next search match.
+
+**Syntax:**
+```
+search-next
+```
+
+**Response:**
+- `OK` on success (view navigates to the match)
+- `ERROR no active search` - If no search has been started
+- `ERROR no more matches` - If there are no more matches forward
+
+**Examples:**
+```
+search-next
+OK
+```
+
+### search-prev
+
+Navigate to the previous search match.
+
+**Syntax:**
+```
+search-prev
+```
+
+**Response:**
+- `OK` on success (view navigates to the match)
+- `ERROR no active search` - If no search has been started
+- `ERROR no more matches` - If there are no more matches backward
+
+**Examples:**
+```
+search-prev
+OK
+```
+
+### search-clear
+
+Clear the current search and remove highlights.
+
+**Syntax:**
+```
+search-clear
+```
+
+**Response:**
+- `OK` always succeeds
+
+**Examples:**
+```
+search-clear
+OK
+```
+
 ## Error Handling
 
 All errors are returned in the format:
@@ -253,9 +348,12 @@ Common errors:
 - `usage: goto <line_number>` - Missing argument for goto
 - `usage: mark <line_number> [<start>-<end>] <color>` - Missing arguments for mark
 - `usage: unmark <line_number> [<start>-<end>]` - Missing argument for unmark
+- `usage: search <regex_pattern>` - Missing pattern for search
 - `invalid line number: <value>` - Non-numeric line argument
 - `line number must be >= 1` - Line 0 is invalid
 - `column numbers must be >= 1` - Column 0 is invalid
 - `start column must be less than end column` - Invalid column range
 - `line out of range: requested <N>, file has <M> lines` - Line beyond file end
 - `line <N> is not marked` - Trying to unmark a line that isn't marked
+- `no active search` - Trying to navigate search results without an active search
+- `invalid regex: <details>` - Invalid regex pattern provided to search

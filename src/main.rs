@@ -4,6 +4,7 @@ mod error;
 mod file_loader;
 mod file_source;
 mod remote_loader;
+mod search;
 mod server;
 
 use std::cell::RefCell;
@@ -17,14 +18,15 @@ use gtk4::gdk::Display;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
-    Adjustment, Application, ApplicationWindow, CssProvider, Label, Orientation, PolicyType,
-    ScrolledWindow, Box as GtkBox, Scrollbar, STYLE_PROVIDER_PRIORITY_APPLICATION,
+    Adjustment, Application, ApplicationWindow, Button, CssProvider, Entry, Label, Orientation,
+    Overlay, PolicyType, ScrolledWindow, Box as GtkBox, Scrollbar, STYLE_PROVIDER_PRIORITY_APPLICATION,
 };
 
 use commands::{CommandResponse, PogCommand};
 use file_loader::MappedFile;
 use file_source::FileSource;
 use remote_loader::RemoteFile;
+use search::{SearchDirection, SearchMatch, SearchState};
 use server::CommandRequest;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -89,12 +91,28 @@ struct Args {
 }
 
 const LINES_PER_PAGE: usize = 50;
+const SEARCH_BUFFER_LINES: usize = 100;
+const SEARCH_HIGHLIGHT_COLOR: &str = "#FFD700";
+const SEARCH_CHUNK_SIZE: usize = 1000;
 
 #[derive(Debug)]
 enum FileRequest {
     GetLines {
         start: usize,
         count: usize,
+        request_id: u64,
+    },
+    SearchRange {
+        pattern: String,
+        start_line: usize,
+        end_line: usize,
+        request_id: u64,
+        navigate_to_first: bool,  // Only navigate to first match on initial search
+    },
+    FindNextMatch {
+        pattern: String,
+        from_line: usize,
+        direction: SearchDirection,
         request_id: u64,
     },
 }
@@ -108,6 +126,20 @@ enum FileResponse {
     },
     Error {
         message: String,
+    },
+    SearchResults {
+        matches: Vec<SearchMatch>,
+        #[allow(dead_code)]
+        request_id: u64,
+        searched_range: (usize, usize),
+        navigate_to_first: bool,
+    },
+    FoundMatch {
+        #[allow(dead_code)]
+        match_info: Option<SearchMatch>,
+        line_num: Option<usize>,
+        #[allow(dead_code)]
+        request_id: u64,
     },
 }
 
@@ -143,6 +175,111 @@ fn spawn_file_worker(
                         });
                     }
                 },
+                FileRequest::SearchRange {
+                    pattern,
+                    start_line,
+                    end_line,
+                    request_id,
+                    navigate_to_first,
+                } => {
+                    match regex::Regex::new(&pattern) {
+                        Ok(regex) => {
+                            let count = end_line.saturating_sub(start_line);
+                            match source.get_lines(start_line, count) {
+                                Ok(lines) => {
+                                    let matches = search::search_lines(&regex, &lines);
+                                    let _ = response_tx.send_blocking(FileResponse::SearchResults {
+                                        matches,
+                                        request_id,
+                                        searched_range: (start_line, end_line),
+                                        navigate_to_first,
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ = response_tx.send_blocking(FileResponse::Error {
+                                        message: e.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = response_tx.send_blocking(FileResponse::Error {
+                                message: format!("invalid regex: {}", e),
+                            });
+                        }
+                    }
+                }
+                FileRequest::FindNextMatch {
+                    pattern,
+                    from_line,
+                    direction,
+                    request_id,
+                } => {
+                    match regex::Regex::new(&pattern) {
+                        Ok(regex) => {
+                            let total_lines = source.line_count();
+                            let mut found: Option<SearchMatch> = None;
+                            let mut found_line: Option<usize> = None;
+
+                            match direction {
+                                SearchDirection::Forward => {
+                                    let mut current = from_line + 1;
+                                    while current < total_lines && found.is_none() {
+                                        let end = (current + SEARCH_CHUNK_SIZE).min(total_lines);
+                                        if let Ok(lines) = source.get_lines(current, end - current) {
+                                            for (line_num, line) in &lines {
+                                                if let Some(mat) = regex.find(line) {
+                                                    found = Some(SearchMatch {
+                                                        line_num: *line_num,
+                                                        start_col: mat.start(),
+                                                        end_col: mat.end(),
+                                                    });
+                                                    found_line = Some(*line_num);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        current = end;
+                                    }
+                                }
+                                SearchDirection::Backward => {
+                                    let mut current_end = from_line;
+                                    while found.is_none() && current_end > 0 {
+                                        let start = current_end.saturating_sub(SEARCH_CHUNK_SIZE);
+                                        if let Ok(lines) = source.get_lines(start, current_end - start) {
+                                            for (line_num, line) in lines.iter().rev() {
+                                                if let Some(mat) = regex.find(line) {
+                                                    found = Some(SearchMatch {
+                                                        line_num: *line_num,
+                                                        start_col: mat.start(),
+                                                        end_col: mat.end(),
+                                                    });
+                                                    found_line = Some(*line_num);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if start == 0 {
+                                            break;
+                                        }
+                                        current_end = start;
+                                    }
+                                }
+                            }
+
+                            let _ = response_tx.send_blocking(FileResponse::FoundMatch {
+                                match_info: found,
+                                line_num: found_line,
+                                request_id,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = response_tx.send_blocking(FileResponse::Error {
+                                message: format!("invalid regex: {}", e),
+                            });
+                        }
+                    }
+                }
             }
         }
     });
@@ -208,7 +345,11 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
     let css_provider = CssProvider::new();
     css_provider.load_from_string(
         ".line-numbers-sidebar { background-color: #2a2a2a; padding-right: 8px; }
-         .line-number { color: #888; }"
+         .line-number { color: #888; }
+         .search-bar { background-color: rgba(50, 50, 50, 0.95); padding: 8px 16px; border-radius: 0 0 8px 8px; }
+         .search-entry { min-width: 300px; }
+         .search-info { color: #aaa; margin-left: 8px; margin-right: 8px; }
+         .search-close { padding: 4px 8px; }"
     );
     gtk4::style_context_add_provider_for_display(
         &Display::default().expect("Could not get default display"),
@@ -218,6 +359,9 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
 
     // Marked lines: line_num (0-based) -> markings (full-line color and/or regions)
     let marked_lines: Rc<RefCell<HashMap<usize, LineMarkings>>> = Rc::new(RefCell::new(HashMap::new()));
+
+    // Search state
+    let search_state: Rc<RefCell<SearchState>> = Rc::new(RefCell::new(SearchState::new()));
 
     // Line numbers sidebar
     let line_numbers_box = GtkBox::new(Orientation::Vertical, 0);
@@ -260,6 +404,33 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
     hbox.append(&h_scroll);
     hbox.append(&v_scrollbar);
 
+    // Search bar UI (overlay)
+    let search_box = GtkBox::new(Orientation::Horizontal, 8);
+    search_box.set_halign(gtk4::Align::Center);
+    search_box.set_valign(gtk4::Align::Start);
+    search_box.set_margin_top(10);
+    search_box.set_css_classes(&["search-bar"]);
+    search_box.set_visible(false);
+
+    let search_entry = Entry::new();
+    search_entry.set_placeholder_text(Some("Search regex..."));
+    search_entry.set_css_classes(&["search-entry"]);
+
+    let search_info = Label::new(Some(""));
+    search_info.set_css_classes(&["search-info"]);
+
+    let search_close_button = Button::with_label("x");
+    search_close_button.set_css_classes(&["search-close"]);
+
+    search_box.append(&search_entry);
+    search_box.append(&search_info);
+    search_box.append(&search_close_button);
+
+    // Overlay to layer search bar over content
+    let overlay = Overlay::new();
+    overlay.set_child(Some(&hbox));
+    overlay.add_overlay(&search_box);
+
     let current_line: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
     let latest_request_id: Rc<RefCell<u64>> = Rc::new(RefCell::new(0));
 
@@ -274,6 +445,10 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
     let current_line_response = current_line.clone();
     let latest_request_id_response = latest_request_id.clone();
     let marked_lines_response = marked_lines.clone();
+    let search_state_response = search_state.clone();
+    let search_info_response = search_info.clone();
+    let v_adjustment_response = v_adjustment.clone();
+    let request_tx_response = request_tx.clone();
 
     glib::spawn_future_local(async move {
         while let Ok(response) = response_rx.recv().await {
@@ -286,12 +461,61 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
                     let latest = *latest_request_id_response.borrow();
                     // Only display if this is the most recent request
                     if request_id == latest {
-                        populate_lines(&line_numbers_box_response, &content_box_response, &lines, &marked_lines_response.borrow());
+                        populate_lines(
+                            &line_numbers_box_response,
+                            &content_box_response,
+                            &lines,
+                            &marked_lines_response.borrow(),
+                            &search_state_response.borrow(),
+                        );
                         *current_line_response.borrow_mut() = start;
                     }
                 }
                 FileResponse::Error { message } => {
                     eprintln!("Error: {}", message);
+                }
+                FileResponse::SearchResults {
+                    matches,
+                    searched_range,
+                    navigate_to_first,
+                    ..
+                } => {
+                    let match_count = matches.len();
+                    let first_match_line = {
+                        let mut state = search_state_response.borrow_mut();
+                        state.update_matches(matches, searched_range);
+                        state.current_match().map(|m| m.line_num)
+                    };
+
+                    if match_count == 0 {
+                        search_info_response.set_text("No matches");
+                    } else {
+                        search_info_response.set_text(&format!("{} matches", match_count));
+                        // Only navigate to first match on initial search, not on re-search
+                        if navigate_to_first {
+                            if let Some(line) = first_match_line {
+                                v_adjustment_response.set_value(line as f64);
+                            }
+                        }
+                    }
+
+                    // Trigger redraw with highlights
+                    let start = v_adjustment_response.value() as usize;
+                    let request_id = next_request_id();
+                    *latest_request_id_response.borrow_mut() = request_id;
+                    let _ = request_tx_response.send_blocking(FileRequest::GetLines {
+                        start,
+                        count: LINES_PER_PAGE,
+                        request_id,
+                    });
+                }
+                FileResponse::FoundMatch { line_num, .. } => {
+                    if let Some(line) = line_num {
+                        search_info_response.set_text(&format!("Match at line {}", line + 1));
+                        v_adjustment_response.set_value(line as f64);
+                    } else {
+                        search_info_response.set_text("No more matches");
+                    }
                 }
             }
         }
@@ -302,6 +526,10 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
     let marked_lines_cmd = marked_lines.clone();
     let request_tx_cmd = request_tx.clone();
     let latest_request_id_cmd = latest_request_id.clone();
+    let search_state_cmd = search_state.clone();
+    let search_box_cmd = search_box.clone();
+    let search_entry_cmd = search_entry.clone();
+    let search_info_cmd = search_info.clone();
     glib::spawn_future_local(async move {
         while let Ok(request) = command_rx.recv().await {
             let response = match request.command {
@@ -423,6 +651,95 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
                         }
                     }
                 }
+                PogCommand::Search { pattern } => {
+                    let mut state = search_state_cmd.borrow_mut();
+                    match state.set_pattern(&pattern) {
+                        Ok(()) => {
+                            // Sync UI with socket-initiated search
+                            search_box_cmd.set_visible(true);
+                            search_entry_cmd.set_text(&pattern);
+                            search_info_cmd.set_text("Searching...");
+
+                            let viewport_start = v_adjustment_cmd.value() as usize;
+                            let search_start = viewport_start.saturating_sub(SEARCH_BUFFER_LINES);
+                            let search_end = (viewport_start + LINES_PER_PAGE + SEARCH_BUFFER_LINES).min(total_lines);
+                            drop(state);
+
+                            let _ = request_tx_cmd.send_blocking(FileRequest::SearchRange {
+                                pattern,
+                                start_line: search_start,
+                                end_line: search_end,
+                                request_id: next_request_id(),
+                                navigate_to_first: true,
+                            });
+
+                            // Return OK since search was initiated (results come async)
+                            CommandResponse::Ok(None)
+                        }
+                        Err(e) => CommandResponse::Error(e),
+                    }
+                }
+                PogCommand::SearchNext => {
+                    let state = search_state_cmd.borrow();
+                    if !state.is_active {
+                        CommandResponse::Error("no active search".to_string())
+                    } else if state.pattern.is_none() {
+                        CommandResponse::Error("no search pattern".to_string())
+                    } else {
+                        let pattern = state.pattern_str.clone();
+                        let current_line = v_adjustment_cmd.value() as usize;
+                        drop(state);
+
+                        let _ = request_tx_cmd.send_blocking(FileRequest::FindNextMatch {
+                            pattern,
+                            from_line: current_line,
+                            direction: SearchDirection::Forward,
+                            request_id: next_request_id(),
+                        });
+                        CommandResponse::Ok(None)
+                    }
+                }
+                PogCommand::SearchPrev => {
+                    let state = search_state_cmd.borrow();
+                    if !state.is_active {
+                        CommandResponse::Error("no active search".to_string())
+                    } else if state.pattern.is_none() {
+                        CommandResponse::Error("no search pattern".to_string())
+                    } else {
+                        let pattern = state.pattern_str.clone();
+                        let current_line = v_adjustment_cmd.value() as usize;
+                        drop(state);
+
+                        let _ = request_tx_cmd.send_blocking(FileRequest::FindNextMatch {
+                            pattern,
+                            from_line: current_line,
+                            direction: SearchDirection::Backward,
+                            request_id: next_request_id(),
+                        });
+                        CommandResponse::Ok(None)
+                    }
+                }
+                PogCommand::SearchClear => {
+                    let mut state = search_state_cmd.borrow_mut();
+                    state.clear();
+                    drop(state);
+
+                    // Sync UI with socket-initiated clear
+                    search_box_cmd.set_visible(false);
+                    search_entry_cmd.set_text("");
+                    search_info_cmd.set_text("");
+
+                    // Trigger redraw to clear highlights
+                    let start = v_adjustment_cmd.value() as usize;
+                    let request_id = next_request_id();
+                    *latest_request_id_cmd.borrow_mut() = request_id;
+                    let _ = request_tx_cmd.send_blocking(FileRequest::GetLines {
+                        start,
+                        count: LINES_PER_PAGE,
+                        request_id,
+                    });
+                    CommandResponse::Ok(None)
+                }
             };
             let _ = request.response_tx.send(response);
         }
@@ -440,6 +757,7 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
     // Scrollbar handler
     let request_tx_scroll = request_tx.clone();
     let latest_request_id_scroll = latest_request_id.clone();
+    let search_state_scroll = search_state.clone();
 
     v_adjustment.connect_value_changed(move |adj| {
         let start_line = adj.value() as usize;
@@ -451,6 +769,24 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
             count: LINES_PER_PAGE,
             request_id,
         });
+
+        // Re-search if search is active and viewport moved outside searched range
+        let state = search_state_scroll.borrow();
+        if state.needs_research(start_line, LINES_PER_PAGE, SEARCH_BUFFER_LINES) {
+            let pattern = state.pattern_str.clone();
+            drop(state);
+
+            let search_start = start_line.saturating_sub(SEARCH_BUFFER_LINES);
+            let search_end = (start_line + LINES_PER_PAGE + SEARCH_BUFFER_LINES).min(total_lines);
+
+            let _ = request_tx_scroll.send_blocking(FileRequest::SearchRange {
+                pattern,
+                start_line: search_start,
+                end_line: search_end,
+                request_id: next_request_id(),
+                navigate_to_first: false,  // Don't navigate on re-search while scrolling
+            });
+        }
     });
 
     // Handle mouse wheel scrolling on the content area
@@ -470,10 +806,134 @@ fn build_ui(app: &Application, file_source: Arc<dyn FileSource>, port: u16, no_s
     });
     h_scroll.add_controller(scroll_controller);
 
-    window.set_child(Some(&hbox));
+    // Close button handler
+    let search_box_close = search_box.clone();
+    let search_state_close = search_state.clone();
+    let search_info_close = search_info.clone();
+    let request_tx_close = request_tx.clone();
+    let latest_request_id_close = latest_request_id.clone();
+    let v_adjustment_close = v_adjustment.clone();
+    search_close_button.connect_clicked(move |_| {
+        search_box_close.set_visible(false);
+        search_state_close.borrow_mut().clear();
+        search_info_close.set_text("");
+        // Trigger redraw to clear highlights
+        let start = v_adjustment_close.value() as usize;
+        let request_id = next_request_id();
+        *latest_request_id_close.borrow_mut() = request_id;
+        let _ = request_tx_close.send_blocking(FileRequest::GetLines {
+            start,
+            count: LINES_PER_PAGE,
+            request_id,
+        });
+    });
+
+    // Keyboard controller for search shortcuts
+    let key_controller = gtk4::EventControllerKey::new();
+    let search_box_key = search_box.clone();
+    let search_entry_key = search_entry.clone();
+    let search_state_key = search_state.clone();
+    let search_info_key = search_info.clone();
+    let request_tx_key = request_tx.clone();
+    let latest_request_id_key = latest_request_id.clone();
+    let v_adjustment_key = v_adjustment.clone();
+
+    key_controller.connect_key_pressed(move |_, key, _code, modifier| {
+        use gtk4::gdk::{Key, ModifierType};
+
+        // Ctrl+F to open search
+        if modifier.contains(ModifierType::CONTROL_MASK) && key == Key::f {
+            search_box_key.set_visible(true);
+            search_entry_key.grab_focus();
+            return glib::Propagation::Stop;
+        }
+
+        // Escape to close search
+        if key == Key::Escape && search_box_key.is_visible() {
+            search_box_key.set_visible(false);
+            search_state_key.borrow_mut().clear();
+            search_info_key.set_text("");
+            // Trigger redraw to clear highlights
+            let start = v_adjustment_key.value() as usize;
+            let request_id = next_request_id();
+            *latest_request_id_key.borrow_mut() = request_id;
+            let _ = request_tx_key.send_blocking(FileRequest::GetLines {
+                start,
+                count: LINES_PER_PAGE,
+                request_id,
+            });
+            return glib::Propagation::Stop;
+        }
+
+        // F3 for next match, Shift+F3 for previous
+        if key == Key::F3 {
+            let state = search_state_key.borrow();
+            if state.is_active && state.pattern.is_some() {
+                let pattern = state.pattern_str.clone();
+                let current_line = v_adjustment_key.value() as usize;
+                drop(state);
+
+                let direction = if modifier.contains(ModifierType::SHIFT_MASK) {
+                    SearchDirection::Backward
+                } else {
+                    SearchDirection::Forward
+                };
+
+                let request_id = next_request_id();
+                let _ = request_tx_key.send_blocking(FileRequest::FindNextMatch {
+                    pattern,
+                    from_line: current_line,
+                    direction,
+                    request_id,
+                });
+            }
+            return glib::Propagation::Stop;
+        }
+
+        glib::Propagation::Proceed
+    });
+    window.add_controller(key_controller);
+
+    // Search entry activate handler (Enter key)
+    let search_state_entry = search_state.clone();
+    let search_info_entry = search_info.clone();
+    let request_tx_entry = request_tx.clone();
+    let v_adjustment_entry = v_adjustment.clone();
+    search_entry.connect_activate(move |entry| {
+        let pattern = entry.text().to_string();
+        if pattern.is_empty() {
+            return;
+        }
+
+        let mut state = search_state_entry.borrow_mut();
+        match state.set_pattern(&pattern) {
+            Ok(()) => {
+                search_info_entry.set_text("Searching...");
+                let viewport_start = v_adjustment_entry.value() as usize;
+                let search_start = viewport_start.saturating_sub(SEARCH_BUFFER_LINES);
+                let search_end = (viewport_start + LINES_PER_PAGE + SEARCH_BUFFER_LINES).min(total_lines);
+                drop(state);
+
+                let request_id = next_request_id();
+                let _ = request_tx_entry.send_blocking(FileRequest::SearchRange {
+                    pattern,
+                    start_line: search_start,
+                    end_line: search_end,
+                    request_id,
+                    navigate_to_first: true,
+                });
+            }
+            Err(e) => {
+                search_info_entry.set_text(&e);
+            }
+        }
+    });
+
+    window.set_child(Some(&overlay));
     window.present();
 }
 
+#[allow(dead_code)]
 fn apply_markings(text: &str, markings: &LineMarkings) -> String {
     let chars: Vec<char> = text.chars().collect();
 
@@ -535,11 +995,83 @@ fn apply_markings(text: &str, markings: &LineMarkings) -> String {
     result
 }
 
+fn apply_all_markings(
+    text: &str,
+    manual_markings: Option<&LineMarkings>,
+    search_matches: &[&SearchMatch],
+) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return String::new();
+    }
+
+    // Build character-level color map with priority:
+    // 1. Manual region marks (highest - user explicit)
+    // 2. Search highlights (middle)
+    // 3. Manual full-line color (lowest - background)
+    let mut char_colors: Vec<Option<String>> = vec![None; chars.len()];
+
+    // Full line color applies to all characters first (as background)
+    if let Some(markings) = manual_markings {
+        if let Some(ref color) = markings.full_line_color {
+            for slot in &mut char_colors {
+                *slot = Some(color.clone());
+            }
+        }
+    }
+
+    // Apply search highlights
+    for search_match in search_matches {
+        for i in search_match.start_col..search_match.end_col.min(chars.len()) {
+            char_colors[i] = Some(SEARCH_HIGHLIGHT_COLOR.to_string());
+        }
+    }
+
+    // Manual region marks override search highlights
+    if let Some(markings) = manual_markings {
+        for region in &markings.regions {
+            for i in region.start_col..region.end_col.min(chars.len()) {
+                char_colors[i] = Some(region.color.clone());
+            }
+        }
+    }
+
+    // Generate markup by grouping consecutive characters with same color
+    let mut result = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let current_color = &char_colors[i];
+        let mut end = i + 1;
+        while end < chars.len() && char_colors[end] == *current_color {
+            end += 1;
+        }
+
+        let segment: String = chars[i..end].iter().collect();
+        let escaped = glib::markup_escape_text(&segment);
+
+        if let Some(color) = current_color {
+            result.push_str(&format!(
+                "<span background=\"{}\">",
+                glib::markup_escape_text(color)
+            ));
+            result.push_str(&escaped);
+            result.push_str("</span>");
+        } else {
+            result.push_str(&escaped);
+        }
+
+        i = end;
+    }
+
+    result
+}
+
 fn populate_lines(
     line_numbers_box: &GtkBox,
     content_box: &GtkBox,
     lines: &[(usize, String)],
     marked_lines: &HashMap<usize, LineMarkings>,
+    search_state: &SearchState,
 ) {
     // Clear both boxes
     while let Some(child) = line_numbers_box.first_child() {
@@ -557,16 +1089,26 @@ fn populate_lines(
         num_label.set_css_classes(&["monospace", "line-number"]);
         line_numbers_box.append(&num_label);
 
-        // Content label
-        let display_text = if let Some(markings) = marked_lines.get(line_num) {
-            apply_markings(text, markings)
+        // Collect search matches for this line
+        let search_matches: Vec<&SearchMatch> = if search_state.is_active {
+            search_state.viewport_matches
+                .iter()
+                .filter(|m| m.line_num == *line_num)
+                .collect()
         } else {
-            glib::markup_escape_text(text).to_string()
+            Vec::new()
         };
 
+        // Content label with combined markings
+        let display_text = apply_all_markings(text, marked_lines.get(line_num), &search_matches);
+
         let label = Label::new(None);
-        label.set_markup(&display_text);
-        label.set_use_markup(true);
+        if display_text.is_empty() {
+            label.set_text("");
+        } else {
+            label.set_markup(&display_text);
+            label.set_use_markup(true);
+        }
         label.set_halign(gtk4::Align::Start);
         label.set_selectable(true);
         label.set_css_classes(&["monospace"]);

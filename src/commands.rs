@@ -15,6 +15,10 @@ pub enum PogCommand {
         line: usize,
         region: Option<(usize, usize)>,  // Optional: specific region to unmark
     },
+    Search { pattern: String },
+    SearchNext,
+    SearchPrev,
+    SearchClear,
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +141,34 @@ pub fn parse_command(input: &str) -> Result<PogCommand, String> {
             };
 
             Ok(PogCommand::Unmark { line, region })
+        }
+        "search" => {
+            if parts.len() < 2 {
+                return Err("usage: search <regex_pattern>".to_string());
+            }
+            let pattern = parts[1..].join(" ");
+            if pattern.is_empty() {
+                return Err("search pattern cannot be empty".to_string());
+            }
+            Ok(PogCommand::Search { pattern })
+        }
+        "search-next" => {
+            if parts.len() != 1 {
+                return Err("usage: search-next".to_string());
+            }
+            Ok(PogCommand::SearchNext)
+        }
+        "search-prev" => {
+            if parts.len() != 1 {
+                return Err("usage: search-prev".to_string());
+            }
+            Ok(PogCommand::SearchPrev)
+        }
+        "search-clear" => {
+            if parts.len() != 1 {
+                return Err("usage: search-clear".to_string());
+            }
+            Ok(PogCommand::SearchClear)
         }
         cmd => Err(format!("unknown command: {}", cmd)),
     }
@@ -275,5 +307,47 @@ mod tests {
             format!("{}", CommandResponse::Error("failed".to_string())),
             "ERROR failed"
         );
+    }
+
+    #[test]
+    fn test_parse_search() {
+        assert_eq!(
+            parse_command("search error"),
+            Ok(PogCommand::Search { pattern: "error".to_string() })
+        );
+        assert_eq!(
+            parse_command("SEARCH Error"),
+            Ok(PogCommand::Search { pattern: "Error".to_string() })
+        );
+        assert_eq!(
+            parse_command("search error.*warning"),
+            Ok(PogCommand::Search { pattern: "error.*warning".to_string() })
+        );
+        assert_eq!(
+            parse_command("search multiple words"),
+            Ok(PogCommand::Search { pattern: "multiple words".to_string() })
+        );
+        assert!(parse_command("search").is_err());
+    }
+
+    #[test]
+    fn test_parse_search_next() {
+        assert_eq!(parse_command("search-next"), Ok(PogCommand::SearchNext));
+        assert_eq!(parse_command("SEARCH-NEXT"), Ok(PogCommand::SearchNext));
+        assert!(parse_command("search-next extra").is_err());
+    }
+
+    #[test]
+    fn test_parse_search_prev() {
+        assert_eq!(parse_command("search-prev"), Ok(PogCommand::SearchPrev));
+        assert_eq!(parse_command("SEARCH-PREV"), Ok(PogCommand::SearchPrev));
+        assert!(parse_command("search-prev extra").is_err());
+    }
+
+    #[test]
+    fn test_parse_search_clear() {
+        assert_eq!(parse_command("search-clear"), Ok(PogCommand::SearchClear));
+        assert_eq!(parse_command("SEARCH-CLEAR"), Ok(PogCommand::SearchClear));
+        assert!(parse_command("search-clear extra").is_err());
     }
 }
